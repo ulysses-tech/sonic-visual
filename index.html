@@ -133,6 +133,30 @@
   }
   #liveCanvas { width: 100%; height: 100%; display: block; }
 
+  #transcriptBox {
+    margin-top: 0.9rem;
+    padding: 0.8rem 1rem;
+    background: #fdfbf7;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+  .transcript-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    display: block;
+    margin-bottom: 0.3rem;
+  }
+  #transcript {
+    margin: 0;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--wave);
+    min-height: 1.4em;
+  }
+  #transcript .empty-t { font-size: 0.85rem; font-weight: 400; color: var(--muted); }
+
   #preview {
     display: flex;
     align-items: flex-end;
@@ -195,6 +219,11 @@
       <span id="status">마이크 권한을 허용한 뒤 녹음 시작을 눌러주세요</span>
     </div>
     <div id="canvasWrap"><canvas id="liveCanvas"></canvas></div>
+    <div id="transcriptBox">
+      <span class="transcript-label">인식된 음성 텍스트</span>
+      <p id="transcript"><span class="empty-t">녹음하면 이 자리에 말한 내용이 표시됩니다</span></p>
+    </div>
+    <p class="note" id="sttNote" style="display:none;">이 브라우저는 음성 인식(Web Speech API)을 지원하지 않아 텍스트 변환은 표시되지 않습니다. 파형 분석·CSV 기능은 정상 작동합니다.</p>
   </section>
 
   <section class="panel">
@@ -212,6 +241,11 @@
       <div class="field">
         <label for="maxD">최대 지름(mm)</label>
         <input type="number" id="maxD" value="23" min="2" max="100">
+      </div>
+      <div class="field">
+        <label for="stepD">지름 단위(mm 간격)</label>
+        <input type="number" id="stepD" value="1" min="0.5" max="10" step="0.5">
+        <div class="val" style="color:var(--muted);">예: 2로 설정 시 지름이 2mm 단위(5, 7, 9…)로만 계산됩니다</div>
       </div>
     </div>
   </section>
@@ -245,6 +279,8 @@ let recording = false;
 let frames = [];
 let startTime = 0;
 let segments = [];
+let recognition = null;
+let finalTranscript = '';
 
 const recBtn = document.getElementById('recBtn');
 const statusEl = document.getElementById('status');
@@ -252,12 +288,15 @@ const segCount = document.getElementById('segCount');
 const segCountOut = document.getElementById('segCountOut');
 const minD = document.getElementById('minD');
 const maxD = document.getElementById('maxD');
+const stepD = document.getElementById('stepD');
 const preview = document.getElementById('preview');
 const downloadBtn = document.getElementById('downloadBtn');
 const dataTable = document.getElementById('dataTable');
 const dataBody = document.getElementById('dataBody');
 const liveCanvas = document.getElementById('liveCanvas');
 const canvasCtx = liveCanvas.getContext('2d');
+const transcriptEl = document.getElementById('transcript');
+const sttNote = document.getElementById('sttNote');
 
 function resizeCanvas() {
   const rect = liveCanvas.parentElement.getBoundingClientRect();
@@ -274,6 +313,7 @@ segCount.addEventListener('input', () => {
 });
 minD.addEventListener('input', () => { if (frames.length > 0) computeSegments(); });
 maxD.addEventListener('input', () => { if (frames.length > 0) computeSegments(); });
+stepD.addEventListener('input', () => { if (frames.length > 0) computeSegments(); });
 
 recBtn.addEventListener('click', async () => {
   if (!recording) {
@@ -289,6 +329,29 @@ recBtn.addEventListener('click', async () => {
       recording = true;
       recBtn.textContent = '녹음 정지';
       statusEl.textContent = '녹음 중입니다. 이름이나 단어를 말한 뒤 정지를 눌러주세요';
+
+      finalTranscript = '';
+      transcriptEl.innerHTML = '<span class="empty-t">듣는 중...</span>';
+      const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognitionAPI) {
+        recognition = new SpeechRecognitionAPI();
+        recognition.lang = 'ko-KR';
+        recognition.continuous = true;
+        recognition.interimResults = true;
+        recognition.onresult = (event) => {
+          let interim = '';
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const text = event.results[i][0].transcript;
+            if (event.results[i].isFinal) finalTranscript += text;
+            else interim += text;
+          }
+          transcriptEl.textContent = (finalTranscript + interim) || '(인식된 내용 없음)';
+        };
+        recognition.onerror = () => { /* 인식 오류는 파형 녹음에 영향 없음 */ };
+        try { recognition.start(); } catch (e) { /* 이미 시작된 경우 무시 */ }
+      } else {
+        sttNote.style.display = 'block';
+      }
 
       const data = new Float32Array(analyser.fftSize);
       const drawData = new Uint8Array(analyser.fftSize);
@@ -343,6 +406,10 @@ function stopRecording() {
   cancelAnimationFrame(canvasRaf);
   if (mic) mic.disconnect();
   if (audioCtx) audioCtx.close();
+  if (recognition) { try { recognition.stop(); } catch (e) {} }
+  if (transcriptEl.textContent.trim() === '' || transcriptEl.querySelector('.empty-t')) {
+    transcriptEl.innerHTML = '<span class="empty-t">인식된 텍스트가 없습니다(마이크 음성인식 미지원 브라우저이거나 무음)</span>';
+  }
   recBtn.textContent = '다시 녹음';
   const dur = frames.length ? frames[frames.length - 1].t.toFixed(2) : 0;
   statusEl.textContent = `녹음 완료 (${dur}초, ${frames.length}개 프레임 수집)`;
@@ -368,13 +435,16 @@ function computeSegments() {
   }
   const minMinD = parseFloat(minD.value) || 5;
   const maxMaxD = parseFloat(maxD.value) || 23;
+  const unit = parseFloat(stepD.value) || 1;
   const amps = segments.map(s => s.amp);
   const ampMin = Math.min(...amps);
   const ampMax = Math.max(...amps);
   const range = ampMax - ampMin || 1;
   segments.forEach(s => {
     const norm = (s.amp - ampMin) / range;
-    s.diameter = Math.round((minMinD + norm * (maxMaxD - minMinD)) * 10) / 10;
+    const raw = minMinD + norm * (maxMaxD - minMinD);
+    s.diameter = Math.round(raw / unit) * unit;
+    s.diameter = Math.round(s.diameter * 100) / 100;
   });
   renderPreview();
   renderTable();
@@ -416,7 +486,8 @@ downloadBtn.addEventListener('click', () => {
   segments.forEach(s => {
     csv += `${s.idx},${s.t.toFixed(3)},${s.amp.toFixed(4)},${s.diameter}\n`;
   });
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const BOM = '\uFEFF';
+  const blob = new Blob([BOM + csv], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
